@@ -7,7 +7,7 @@
  */
 
 const OPEN_ENDED_GRADER = Object.freeze({
-  version: '1.0.0',
+  version: '1.1.0',
   settingsSheet: '設定',
   previewSheet: '入力内容確認',
   resultMarker: '[OpenEndedSpreadsheetGraderResult]',
@@ -294,6 +294,7 @@ function gradeSubmissionFiles_(files, settings, context, apiKey) {
       needsReview: true,
       foundSheets: [],
       missingSheets: [],
+      ambiguousSheets: [],
       truncated: false,
       error: ''
     };
@@ -303,6 +304,7 @@ function gradeSubmissionFiles_(files, settings, context, apiKey) {
       const snapshot = snapshotSubmission_(submission, settings);
       summary.foundSheets = snapshot.foundSheets;
       summary.missingSheets = snapshot.missingSheets;
+      summary.ambiguousSheets = snapshot.ambiguousSheets;
       summary.truncated = snapshot.truncated;
       const evaluation = evaluateSubmission_(file.getName(), snapshot.text, settings, context, apiKey);
       summary.score = evaluation.score;
@@ -311,7 +313,10 @@ function gradeSubmissionFiles_(files, settings, context, apiKey) {
       summary.strengths = evaluation.strengths;
       summary.improvements = evaluation.improvements;
       summary.confidence = evaluation.confidence;
-      summary.needsReview = evaluation.needsReview || snapshot.missingSheets.length > 0 || snapshot.truncated;
+      summary.needsReview = evaluation.needsReview
+        || snapshot.missingSheets.length > 0
+        || snapshot.ambiguousSheets.length > 0
+        || snapshot.truncated;
       evaluation.criteria.forEach(function(criterion) {
         details.push([
           file.getName(),
@@ -336,17 +341,26 @@ function snapshotSubmission_(spreadsheet, settings) {
   const sections = ['提出スプレッドシート名: ' + spreadsheet.getName()];
   const foundSheets = [];
   const missingSheets = [];
+  const ambiguousSheets = [];
   let truncated = false;
 
   settings.targetSheetNames.forEach(function(sheetName) {
-    const sheet = spreadsheet.getSheetByName(sheetName);
-    if (!sheet) {
+    const match = findTargetSheet_(spreadsheet, sheetName);
+    if (!match.sheet) {
       missingSheets.push(sheetName);
       sections.push('--- シート「' + sheetName + '」: 見つかりません ---');
       return;
     }
-    foundSheets.push(sheetName);
-    const serialized = serializeSheet_(sheet, settings.maxCellsPerSheet);
+    const actualName = match.sheet.getName();
+    foundSheets.push(actualName);
+    if (actualName !== sheetName) {
+      sections.push('[シート名の表記ゆれを吸収] 指定=' + sheetName + '; 実際=' + actualName);
+    }
+    if (match.ambiguous) {
+      ambiguousSheets.push(sheetName + ' -> ' + match.candidateNames.join(' / '));
+      sections.push('[要確認] 正規化後に複数の候補があるため「' + actualName + '」を採点しました。');
+    }
+    const serialized = serializeSheet_(match.sheet, settings.maxCellsPerSheet);
     sections.push(serialized);
     if (serialized.indexOf('[読取範囲を制限しました]') !== -1) {
       truncated = true;
@@ -362,8 +376,34 @@ function snapshotSubmission_(spreadsheet, settings) {
     text: limited,
     foundSheets: foundSheets,
     missingSheets: missingSheets,
+    ambiguousSheets: ambiguousSheets,
     truncated: truncated
   };
+}
+
+function findTargetSheet_(spreadsheet, requestedName) {
+  const exact = spreadsheet.getSheetByName(requestedName);
+  if (exact) {
+    return { sheet: exact, ambiguous: false, candidateNames: [exact.getName()] };
+  }
+
+  const normalizedTarget = normalizeSheetName_(requestedName);
+  const candidates = spreadsheet.getSheets().filter(function(sheet) {
+    return normalizeSheetName_(sheet.getName()) === normalizedTarget;
+  });
+  return {
+    sheet: candidates.length > 0 ? candidates[0] : null,
+    ambiguous: candidates.length > 1,
+    candidateNames: candidates.map(function(sheet) { return sheet.getName(); })
+  };
+}
+
+function normalizeSheetName_(name) {
+  let normalized = String(name || '').trim();
+  if (typeof normalized.normalize === 'function') {
+    normalized = normalized.normalize('NFKC');
+  }
+  return normalized.replace(/\s+/g, '').toLowerCase();
 }
 
 function serializeSheet_(sheet, maxCells) {
@@ -629,7 +669,7 @@ function createResultSpreadsheet_(folder, grading, settings, context) {
 function writeSummarySheet_(sheet, summaries) {
   const headers = [
     'ファイル名', '得点', '満点', '得点率', '総評', '良かった点', '改善点',
-    'AI確信度', '要確認', '読取シート', '不足シート', '答案省略あり', 'エラー', '提出ファイルURL'
+    'AI確信度', '要確認', '読取シート', '不足シート', '表記ゆれ重複候補', '答案省略あり', 'エラー', '提出ファイルURL'
   ];
   const rows = summaries.map(function(summary) {
     return [
@@ -644,6 +684,7 @@ function writeSummarySheet_(sheet, summaries) {
       summary.needsReview,
       summary.foundSheets.join(', '),
       summary.missingSheets.join(', '),
+      summary.ambiguousSheets.join(', '),
       summary.truncated,
       summary.error,
       summary.fileUrl
